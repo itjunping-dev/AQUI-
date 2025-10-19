@@ -52,7 +52,7 @@
             onSnapshot,
             serverTimestamp,
             getDoc,
-            deleteDoc // Added for deletion functionality
+            deleteDoc
         };
     </script>
 
@@ -65,18 +65,35 @@
 
         const { useState, useEffect, useCallback, StrictMode } = React;
 
-        // --- Firebase Initialization ---
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
-        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        // --- Firebase Initialization & Environment Check ---
+        
+        // 检查 Canvas 环境提供的全局变量
+        const canvasConfigString = typeof __firebase_config !== 'undefined' ? __firebase_config : null;
+        const canvasAppId = typeof __app_id !== 'undefined' ? __app_id : 'public-demo-cashier-app-gh';
+        const canvasAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        // 确定是否处于公共演示模式 (无 Canvas 配置)
+        const isPublicDemo = !canvasConfigString;
 
-        let app, db, auth;
-        if (Object.keys(firebaseConfig).length > 0) {
-            app = initializeApp(firebaseConfig);
-            db = getFirestore(app);
-            auth = getAuth(app);
+        let app = null, db = null, auth = null;
+        let finalAppId = canvasAppId;
+
+        if (!isPublicDemo) {
+            // Running in Canvas (Use real Firebase)
+            try {
+                const firebaseConfig = JSON.parse(canvasConfigString);
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                console.log("Firebase initialized with Canvas configuration.");
+            } catch (e) {
+                // Should not happen, but for robustness:
+                console.error("Failed to parse Firebase config from Canvas:", e);
+                isPublicDemo = true;
+            }
         } else {
-            console.warn("Firebase no está configurado.");
+            // Running on GitHub Pages (Demo Mode - Skip API calls to prevent invalid key error)
+            console.warn("Running in public demo mode. Firebase backend disabled to prevent API key error.");
         }
         
         // --- App Constants (Spanish Translation) ---
@@ -152,7 +169,7 @@
             const [userId, setUserId] = useState(null);
             const [isAuthReady, setIsAuthReady] = useState(false);
             
-            // Data from Firestore
+            // Data from Firestore (will be empty in demo mode)
             const [cashierRecords, setCashierRecords] = useState([]);
             const [actualCollections, setActualCollections] = useState([]);
             const [reconciliationReports, setReconciliationReports] = useState([]);
@@ -166,33 +183,67 @@
             
             // --- Firebase Auth & Data Listeners ---
             useEffect(() => {
+                if (isPublicDemo) {
+                    // Public Demo: Skip Firebase API calls, set ready immediately and use dummy ID
+                    setUserId(`DEMO_USER_${Math.random().toString(36).substring(2, 9)}`);
+                    setIsAuthReady(true);
+                    setIsLoading(false);
+                    return; 
+                }
+
                 if (!app) {
                     console.error("Firebase no está configurado.");
                     setIsLoading(false);
                     return;
                 }
+                
+                // Original Auth Logic for Canvas environment
                 const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
                     setUserId(user ? user.uid : `anonymous_${crypto.randomUUID()}`);
                     setIsAuthReady(true);
                 });
+
                 if (!auth.currentUser) {
                     (async () => {
                         try {
-                            if (initialAuthToken) await signInWithCustomToken(auth, initialAuthToken);
-                            else await signInAnonymously(auth);
-                        } catch (error) { console.error("Error de autenticación:", error); }
+                            if (canvasAuthToken) {
+                                await signInWithCustomToken(auth, canvasAuthToken);
+                            } else {
+                                await signInAnonymously(auth);
+                            }
+                        } catch (error) { 
+                            // This catches the original API key error if the demo flag failed, but should not happen now.
+                            console.error("Error de autenticación:", error);
+                            // Ensure the app renders even if sign-in fails
+                            setIsAuthReady(true); 
+                        }
                     })();
                 }
                 return () => unsubscribeAuth();
             }, []);
 
-            const getCollectionPath = useCallback((collectionName) => `/artifacts/${appId}/users/${userId}/${collectionName}`, [userId]);
+            const getCollectionPath = useCallback((collectionName) => {
+                // In public demo mode, we return null to skip Firestore operations
+                if (isPublicDemo || !userId) return null; 
+                return `/artifacts/${finalAppId}/users/${userId}/${collectionName}`;
+            }, [userId, finalAppId, isPublicDemo]);
 
             useEffect(() => {
+                if (isPublicDemo) {
+                    // In public demo, we use empty arrays for all data
+                    setCashierRecords([]);
+                    setActualCollections([]);
+                    setReconciliationReports([]);
+                    setIsLoading(false);
+                    return;
+                }
+
                 if (!isAuthReady || !db || !userId) return;
+                
                 setIsLoading(true);
                 setLoadingMessage("Cargando datos...");
                 
+                // Firestore Listeners - Only run in Canvas environment
                 const cashierPath = getCollectionPath('cashier_records');
                 const actualPath = getCollectionPath('actual_collections');
                 const reportPath = getCollectionPath('reconciliation_reports');
@@ -211,11 +262,11 @@
                 }, (error) => console.error("Error loading reports:", error));
 
                 return () => { unsubCashier(); unsubActual(); unsubReports(); };
-            }, [isAuthReady, db, userId, getCollectionPath]);
+            }, [isAuthReady, db, userId, getCollectionPath, isPublicDemo]); // Added isPublicDemo dependency
 
             // --- Reconciliation Logic ---
             const reconcileRecords = useCallback(async (date) => {
-                if (!db || !userId) return;
+                if (isPublicDemo || !db || !userId) return; // Skip in demo mode
                 const expected = cashierRecords.filter(r => r.date === date);
                 const actual = actualCollections.filter(r => r.date === date);
                 
@@ -237,19 +288,22 @@
                 
                 const reportRef = doc(db, getCollectionPath('reconciliation_reports'), date);
                 await setDoc(reportRef, { date, timestamp: serverTimestamp(), details: reportDetails }, { merge: true });
-            }, [cashierRecords, actualCollections, db, userId, getCollectionPath]);
+            }, [cashierRecords, actualCollections, db, userId, getCollectionPath, isPublicDemo]);
             
             useEffect(() => {
-                if (isAuthReady) {
+                if (isAuthReady && !isPublicDemo) {
                     // Only reconcile if there are any records at all
                     const allDates = new Set([...cashierRecords.map(r => r.date), ...actualCollections.map(r => r.date)]);
                     allDates.forEach(date => reconcileRecords(date));
                 }
-            }, [cashierRecords, actualCollections, isAuthReady, reconcileRecords]);
+            }, [cashierRecords, actualCollections, isAuthReady, reconcileRecords, isPublicDemo]);
             
             // --- Form Handling & Data Loading ---
             const loadExistingRecord = useCallback(async () => {
-                if (!db || !userId || !inputDate || !inputCaja || !inputShift) return;
+                if (isPublicDemo || !db || !userId || !inputDate || !inputCaja || !inputShift) {
+                    setInputDetails(Object.keys(PAYMENT_METHODS).reduce((acc, k) => ({ ...acc, [k]: '' }), {}));
+                    return;
+                }
                 const collectionName = formType === 'expected' ? 'cashier_records' : 'actual_collections';
                 const key = `${inputDate}_${inputCaja}_${inputShift}`;
                 const docRef = doc(db, getCollectionPath(collectionName), key);
@@ -266,7 +320,7 @@
                         setInputDetails(Object.keys(PAYMENT_METHODS).reduce((acc, k) => ({ ...acc, [k]: '' }), {}));
                     }
                 } catch (error) { console.error("Error cargando registro existente:", error); }
-            }, [db, userId, inputDate, inputCaja, inputShift, formType, getCollectionPath]);
+            }, [db, userId, inputDate, inputCaja, inputShift, formType, getCollectionPath, isPublicDemo]);
 
             useEffect(() => { loadExistingRecord(); }, [loadExistingRecord]);
             
@@ -295,7 +349,10 @@
             }, [navigate]);
 
             const handleDeleteRecord = async (record, type) => {
-                if (!db || !userId) return;
+                if (isPublicDemo || !db || !userId) { // Skip in demo mode
+                    setModal({ title: "Advertencia", message: "La eliminación de datos está deshabilitada en el modo de demostración pública." });
+                    return;
+                }
 
                 const collectionPath = getCollectionPath(type === 'expected' ? 'cashier_records' : 'actual_collections');
                 const key = `${record.date}_${record.caja}_${record.shift}`;
@@ -365,6 +422,12 @@
                     setModal({ title: "Error", message: "El campo 'Caja' es obligatorio." });
                     return;
                 }
+                
+                if (isPublicDemo || !db || !userId) {
+                    setModal({ title: "Advertencia", message: "El guardado de datos está deshabilitado en el modo de demostración pública." });
+                    return;
+                }
+
                 setLoadingMessage("Guardando...");
                 setIsLoading(true);
                 const key = `${inputDate}_${inputCaja}_${inputShift}`;
@@ -409,6 +472,11 @@
                 <Page>
                     <Header title="Conciliación de Caja" />
                     <main className="p-4 space-y-3">
+                        {isPublicDemo && (
+                            <div className="p-3 bg-yellow-100 text-yellow-800 rounded-lg font-bold text-center mb-4">
+                                📢 Modo de Demostración Pública: El guardado de datos está deshabilitado.
+                            </div>
+                        )}
                         <MainMenuButton title="1. Registrar Monto del Sistema (Esperado)" subtitle="Monto teórico del sistema al cierre" onClick={() => navigate(PAGE.SYSTEM_INPUT, 'expected')} />
                         <MainMenuButton title="2. Registrar Monto Real (Recaudado)" subtitle="Monto recaudado por conteo físico" onClick={() => navigate(PAGE.ACTUAL_INPUT, 'actual')} />
                         <MainMenuButton title="3. Ver Reportes de Conciliación" subtitle="Revisar las diferencias por turno/caja" onClick={() => navigate(PAGE.REPORTS)} />
@@ -503,6 +571,11 @@
                     <Page>
                         <Header title="Administrar Datos" onBack={() => setCurrentPage(PAGE.HOME)} />
                         <div className="p-4">
+                            {isPublicDemo && (
+                                <div className="p-3 bg-red-100 text-red-800 rounded-lg font-bold text-center mb-4">
+                                    📢 Las funciones de edición/eliminación están deshabilitadas en el modo de demostración.
+                                </div>
+                            )}
                             <div className="flex space-x-2 mb-4">
                                 <button 
                                     onClick={() => setActiveTab('expected')} 
@@ -528,13 +601,13 @@
                                         </div>
                                         <div className="flex space-x-2 text-sm">
                                             <button 
-                                                onClick={() => handleEditRecord(record, type)} 
-                                                className="bg-blue-500 text-white px-3 py-1 rounded-md hover:bg-blue-600">
+                                                onClick={() => isPublicDemo ? setModal({ title: "Advertencia", message: "Edición deshabilitada en el modo de demostración." }) : handleEditRecord(record, type)} 
+                                                className={`px-3 py-1 rounded-md text-white ${isPublicDemo ? 'bg-gray-400 cursor-not-allowed' : 'bg-blue-500 hover:bg-blue-600'}`}>
                                                 Editar
                                             </button>
                                             <button 
                                                 onClick={() => handleDeleteRecord(record, type)} 
-                                                className="bg-red-500 text-white px-3 py-1 rounded-md hover:bg-red-600">
+                                                className={`px-3 py-1 rounded-md text-white ${isPublicDemo ? 'bg-gray-400 cursor-not-allowed' : 'bg-red-500 hover:bg-red-600'}`}>
                                                 Eliminar
                                             </button>
                                         </div>
@@ -618,6 +691,11 @@
                 <Page>
                     <Header title="Todos los Datos Crudos" onBack={() => setCurrentPage(PAGE.HOME)} />
                     <div className="p-4 space-y-6">
+                        {isPublicDemo && (
+                            <div className="p-3 bg-red-100 text-red-800 rounded-lg font-bold text-center">
+                                No se pueden mostrar datos persistentes en modo de demostración.
+                            </div>
+                        )}
                         <div>
                             <h2 className="text-lg font-bold mb-2 p-2 bg-gray-200 rounded-t-md">Datos Esperados (Sistema)</h2>
                             <div className="bg-white p-2 rounded-b-md shadow max-h-64 overflow-y-auto">
